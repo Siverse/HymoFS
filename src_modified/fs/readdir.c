@@ -199,7 +199,6 @@ SYSCALL_DEFINE3(old_readdir, unsigned int, fd,
 #ifdef CONFIG_HYMOFS
 	hymofs_prepare_readdir(&buf.hymo, f.file);
 #endif
-
 	error = iterate_dir(f.file, &buf.ctx);
 	if (buf.result)
 		error = buf.result;
@@ -233,6 +232,9 @@ struct getdents_callback {
 	int prev_reclen;
 	int count;
 	int error;
+#ifdef CONFIG_HYMOFS
+	bool buffer_full;
+#endif
 };
 
 static bool filldir(struct dir_context *ctx, const char *name, int namlen,
@@ -253,8 +255,12 @@ static bool filldir(struct dir_context *ctx, const char *name, int namlen,
 	if (unlikely(buf->error))
 		return false;
 	buf->error = -EINVAL;	/* only used if we fail.. */
-	if (reclen > buf->count)
+	if (reclen > buf->count) {
+#ifdef CONFIG_HYMOFS
+		buf->buffer_full = true;
+#endif
 		return false;
+	}
 	d_ino = ino;
 	if (sizeof(d_ino) < sizeof(ino) && d_ino != ino) {
 		buf->error = -EOVERFLOW;
@@ -295,6 +301,9 @@ SYSCALL_DEFINE3(getdents, unsigned int, fd,
 		.ctx.actor = filldir,
 		.count = count,
 		.current_dir = dirent
+#ifdef CONFIG_HYMOFS
+		, .buffer_full = false
+#endif
 	};
 	int error;
 
@@ -329,7 +338,7 @@ SYSCALL_DEFINE3(getdents, unsigned int, fd,
 			error = count - buf.count;
 	}
 #ifdef CONFIG_HYMOFS
-	if (error >= 0) {
+	if (error >= 0 && !buf.buffer_full && buf.ctx.pos < HYMO_MAGIC_POS && !signal_pending(current) && buf.count == count) {
 		void __user *dir_ptr = buf.current_dir;
 		int res = hymofs_inject_entries(&buf.hymo, &dir_ptr, &buf.count, &f.file->f_pos);
 		if (res > 0)
@@ -350,6 +359,9 @@ struct getdents_callback64 {
 	int prev_reclen;
 	int count;
 	int error;
+#ifdef CONFIG_HYMOFS
+	bool buffer_full;
+#endif
 };
 
 static bool filldir64(struct dir_context *ctx, const char *name, int namlen,
@@ -369,8 +381,12 @@ static bool filldir64(struct dir_context *ctx, const char *name, int namlen,
 	if (unlikely(buf->error))
 		return false;
 	buf->error = -EINVAL;	/* only used if we fail.. */
-	if (reclen > buf->count)
+	if (reclen > buf->count) {
+#ifdef CONFIG_HYMOFS
+		buf->buffer_full = true;
+#endif
 		return false;
+	}
 	prev_reclen = buf->prev_reclen;
 	if (prev_reclen && signal_pending(current))
 		return false;
@@ -407,6 +423,9 @@ SYSCALL_DEFINE3(getdents64, unsigned int, fd,
 		.ctx.actor = filldir64,
 		.count = count,
 		.current_dir = dirent
+#ifdef CONFIG_HYMOFS
+		, .buffer_full = false
+#endif
 	};
 	int error;
 
@@ -442,7 +461,7 @@ SYSCALL_DEFINE3(getdents64, unsigned int, fd,
 			error = count - buf.count;
 	}
 #ifdef CONFIG_HYMOFS
-	if (error >= 0) {
+	if (error >= 0 && !buf.buffer_full && buf.ctx.pos < HYMO_MAGIC_POS && !signal_pending(current) && buf.count == count) {
 		void __user *dir_ptr = buf.current_dir;
 		int res = hymofs_inject_entries64(&buf.hymo, &dir_ptr, &buf.count, &f.file->f_pos);
 		if (res > 0)
