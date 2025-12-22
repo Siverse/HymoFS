@@ -168,9 +168,7 @@ static void hymofs_reorder_mnt_id(void)
         
         if (m->mnt_devname && (
             strcmp(m->mnt_devname, HYMO_MIRROR_PATH) == 0 || 
-            strcmp(m->mnt_devname, HYMO_CTL_PATH) == 0 ||
-            strcmp(m->mnt_devname, HYMO_MIRROR_NAME) == 0 ||
-            strcmp(m->mnt_devname, HYMO_CTL_NAME) == 0
+            strcmp(m->mnt_devname, HYMO_MIRROR_NAME) == 0
         )) {
             is_hymo_mount = true;
         }
@@ -758,8 +756,12 @@ bool __hymofs_should_hide(const char *pathname)
 
     /* Hide control interface from non-root if stealth is enabled */
     if (hymo_stealth_enabled) {
-        if (strcmp(pathname, HYMO_CTL_NAME) == 0 || strcmp(pathname, HYMO_CTL_PATH) == 0) return true;
-        if (strcmp(pathname, HYMO_MIRROR_NAME) == 0 || strcmp(pathname, HYMO_MIRROR_PATH) == 0) return true;
+#ifdef CONFIG_HYMOFS_USE_KSU
+        if (susfs_is_current_ksu_domain()) return false;
+#endif
+        /* Fast check using length first */
+        if (len == sizeof(HYMO_MIRROR_NAME)-1 && strcmp(pathname, HYMO_MIRROR_NAME) == 0) return true;
+        if (len == sizeof(HYMO_MIRROR_PATH)-1 && strcmp(pathname, HYMO_MIRROR_PATH) == 0) return true;
     }
 
     hash = full_name_hash(NULL, pathname, strlen(pathname));
