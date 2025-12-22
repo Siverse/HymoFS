@@ -35,7 +35,16 @@
 #include "mount.h"
 
 #include "hymofs.h"
-#include "hymofs_ioctl.h"
+#include <linux/hymo_magic.h>
+
+extern int (*hymo_dispatch_cmd_hook)(unsigned int cmd, void __user *arg);
+
+#define CONFIG_HYMOFS_USE_KSU
+#ifdef CONFIG_HYMOFS_USE_KSU
+extern bool susfs_is_current_ksu_domain(void);
+#endif
+
+extern bool hymo_is_avc_log_spoofing_enabled;
 
 #ifdef CONFIG_HYMOFS
 
@@ -238,8 +247,8 @@ static void hymofs_spoof_mounts(void)
     kfree(system_devname);
 }
 
-static long hymo_ioctl(struct file *file, unsigned int cmd, unsigned long arg) {
-    struct hymo_ioctl_arg req;
+static int hymo_dispatch_cmd(unsigned int cmd, void __user *arg) {
+    struct hymo_syscall_arg req;
     struct hymo_entry *entry;
     struct hymo_hide_entry *hide_entry;
     struct hymo_inject_entry *inject_entry;
@@ -249,7 +258,7 @@ static long hymo_ioctl(struct file *file, unsigned int cmd, unsigned long arg) {
     bool found = false;
     int ret = 0;
 
-    if (cmd == HYMO_IOC_CLEAR_ALL) {
+    if (cmd == HYMO_CMD_CLEAR_ALL) {
         spin_lock_irqsave(&hymo_lock, flags);
         hymo_cleanup();
         atomic_inc(&hymo_version);
@@ -257,27 +266,27 @@ static long hymo_ioctl(struct file *file, unsigned int cmd, unsigned long arg) {
         return 0;
     }
     
-    if (cmd == HYMO_IOC_GET_VERSION) {
+    if (cmd == HYMO_CMD_GET_VERSION) {
         return HYMO_PROTOCOL_VERSION;
     }
 
-    if (cmd == HYMO_IOC_SET_DEBUG) {
+    if (cmd == HYMO_CMD_SET_DEBUG) {
         int val;
-        if (copy_from_user(&val, (void __user *)arg, sizeof(val))) return -EFAULT;
+        if (copy_from_user(&val, arg, sizeof(val))) return -EFAULT;
         hymo_debug_enabled = !!val;
         hymo_log("debug mode %s\n", hymo_debug_enabled ? "enabled" : "disabled");
         return 0;
     }
 
-    if (cmd == HYMO_IOC_REORDER_MNT_ID) {
+    if (cmd == HYMO_CMD_REORDER_MNT_ID) {
         hymofs_spoof_mounts();
         hymofs_reorder_mnt_id();
         return 0;
     }
 
-    if (cmd == HYMO_IOC_SET_STEALTH) {
+    if (cmd == HYMO_CMD_SET_STEALTH) {
         int val;
-        if (copy_from_user(&val, (void __user *)arg, sizeof(val))) return -EFAULT;
+        if (copy_from_user(&val, arg, sizeof(val))) return -EFAULT;
         hymo_stealth_enabled = !!val;
         hymo_log("stealth mode %s\n", hymo_stealth_enabled ? "enabled" : "disabled");
         if (hymo_stealth_enabled) {
@@ -287,7 +296,7 @@ static long hymo_ioctl(struct file *file, unsigned int cmd, unsigned long arg) {
         return 0;
     }
 
-    if (copy_from_user(&req, (void __user *)arg, sizeof(req))) return -EFAULT;
+    if (copy_from_user(&req, arg, sizeof(req))) return -EFAULT;
 
     if (req.src) {
         src = strndup_user(req.src, PAGE_SIZE);
@@ -302,7 +311,65 @@ static long hymo_ioctl(struct file *file, unsigned int cmd, unsigned long arg) {
     }
 
     switch (cmd) {
-        case HYMO_IOC_ADD_RULE: {
+        case HYMO_CMD_ADD_MERGE_RULE: {
+            struct hymo_merge_entry *merge_entry;
+            if (!src || !target) { ret = -EINVAL; break; }
+            
+            hymo_log("add merge rule: src=%s, target=%s\n", src, target);
+            
+            hash = full_name_hash(NULL, src, strlen(src));
+            spin_lock_irqsave(&hymo_lock, flags);
+            
+            // Check if exists
+            hash_for_each_possible(hymo_merge_dirs, merge_entry, node, hash) {
+                if (strcmp(merge_entry->src, src) == 0 && strcmp(merge_entry->target, target) == 0) {
+                    found = true;
+                    break;
+                }
+            }
+            
+            if (!found) {
+                merge_entry = kmalloc(sizeof(*merge_entry), GFP_ATOMIC);
+                if (merge_entry) {
+                    merge_entry->src = src;
+                    merge_entry->target = target;
+                    hash_add(hymo_merge_dirs, &merge_entry->node, hash);
+                    
+                    /* Add inject rule if not present */
+                    {
+                        struct hymo_inject_entry *inj;
+                        bool inj_found = false;
+                        hash_for_each_possible(hymo_inject_dirs, inj, node, hash) {
+                            if (strcmp(inj->dir, src) == 0) {
+                                inj_found = true;
+                                break;
+                            }
+                        }
+                        if (!inj_found) {
+                            inj = kmalloc(sizeof(*inj), GFP_ATOMIC);
+                            if (inj) {
+                                inj->dir = kstrdup(src, GFP_ATOMIC);
+                                if (inj->dir) hash_add(hymo_inject_dirs, &inj->node, hash);
+                                else kfree(inj);
+                            }
+                        }
+                    }
+                    
+                    src = NULL; // Ownership transferred
+                    target = NULL;
+                    hymofs_add_inject_rule(kstrdup(merge_entry->src, GFP_ATOMIC)); // Also mark for injection
+                } else {
+                    ret = -ENOMEM;
+                }
+            } else {
+                ret = -EEXIST;
+            }
+            atomic_inc(&hymo_atomiconfig);
+            spin_unlock_irqrestore(&hymo_lock, flags);
+            break;
+        }
+
+        case HYMO_CMD_ADD_RULE: {
             char *parent_dir = NULL;
             char *resolved_src = NULL;
             struct path path;
@@ -381,31 +448,34 @@ static long hymo_ioctl(struct file *file, unsigned int cmd, unsigned long arg) {
 
             hash = full_name_hash(NULL, src, strlen(src));
             spin_lock_irqsave(&hymo_lock, flags);
-            hash_for_each_possible(hymo_paths, entry, node, hash) {
-                if (strcmp(entry->src, src) == 0) {
-                    hash_del(&entry->target_node);
-                    kfree(entry->target);
-                    entry->target = kstrdup(target, GFP_ATOMIC);
-                    entry->type = req.type;
-                    if (entry->target)
-                        hash_add(hymo_targets, &entry->target_node, full_name_hash(NULL, entry->target, strlen(entry->target)));
-                    found = true;
-                    break;
-                }
-            }
-            if (!found) {
-                entry = kmalloc(sizeof(*entry), GFP_ATOMIC);
-                if (entry) {
-                    entry->src = kstrdup(src, GFP_ATOMIC);
-                    entry->target = kstrdup(target, GFP_ATOMIC);
-                    entry->type = req.type;
-                    if (entry->src && entry->target) {
-                        hash_add(hymo_paths, &entry->node, hash);
-                        hash_add(hymo_targets, &entry->target_node, full_name_hash(NULL, entry->target, strlen(entry->target)));
-                    } else {
-                        kfree(entry->src);
+
+            {
+                hash_for_each_possible(hymo_paths, entry, node, hash) {
+                    if (strcmp(entry->src, src) == 0) {
+                        hash_del(&entry->target_node);
                         kfree(entry->target);
-                        kfree(entry);
+                        entry->target = kstrdup(target, GFP_ATOMIC);
+                        entry->type = req.type;
+                        if (entry->target)
+                            hash_add(hymo_targets, &entry->target_node, full_name_hash(NULL, entry->target, strlen(entry->target)));
+                        found = true;
+                        break;
+                    }
+                }
+                if (!found) {
+                    entry = kmalloc(sizeof(*entry), GFP_ATOMIC);
+                    if (entry) {
+                        entry->src = kstrdup(src, GFP_ATOMIC);
+                        entry->target = kstrdup(target, GFP_ATOMIC);
+                        entry->type = req.type;
+                        if (entry->src && entry->target) {
+                            hash_add(hymo_paths, &entry->node, hash);
+                            hash_add(hymo_targets, &entry->target_node, full_name_hash(NULL, entry->target, strlen(entry->target)));
+                        } else {
+                            kfree(entry->src);
+                            kfree(entry->target);
+                            kfree(entry);
+                        }
                     }
                 }
             }
@@ -420,7 +490,7 @@ static long hymo_ioctl(struct file *file, unsigned int cmd, unsigned long arg) {
             break;
         }
 
-        case HYMO_IOC_HIDE_RULE: {
+        case HYMO_CMD_HIDE_RULE: {
             char *resolved_src = NULL;
             struct path path;
             char *tmp_buf = kmalloc(PATH_MAX, GFP_KERNEL);
@@ -471,7 +541,7 @@ static long hymo_ioctl(struct file *file, unsigned int cmd, unsigned long arg) {
             break;
         }
 
-        case HYMO_IOC_HIDE_OVERLAY_XATTRS: {
+        case HYMO_CMD_HIDE_OVERLAY_XATTRS: {
             struct path path;
             struct hymo_xattr_sb_entry *sb_entry;
             bool found = false;
@@ -505,7 +575,7 @@ static long hymo_ioctl(struct file *file, unsigned int cmd, unsigned long arg) {
             break;
         }
 
-        case HYMO_IOC_DEL_RULE:
+        case HYMO_CMD_DEL_RULE:
             if (!src) { ret = -EINVAL; break; }
             hymo_log("del rule: src=%s\n", src);
             hash = full_name_hash(NULL, src, strlen(src));
@@ -544,8 +614,8 @@ static long hymo_ioctl(struct file *file, unsigned int cmd, unsigned long arg) {
             spin_unlock_irqrestore(&hymo_lock, flags);
             break;
 
-        case HYMO_IOC_LIST_RULES: {
-            struct hymo_ioctl_list_arg list_arg;
+        case HYMO_CMD_LIST_RULES: {
+            struct hymo_syscall_list_arg list_arg;
             char *kbuf;
             size_t buf_size;
             size_t written = 0;
@@ -604,9 +674,19 @@ static long hymo_ioctl(struct file *file, unsigned int cmd, unsigned long arg) {
             break;
         }
 
-        case HYMO_IOC_REORDER_MNT_ID:
+        case HYMO_CMD_REORDER_MNT_ID:
             hymo_log("reordering mount IDs\n");
             hymofs_reorder_mnt_id();
+            break;
+
+        case HYMO_CMD_SET_AVC_LOG_SPOOFING:
+            if (req.type) {
+                hymo_is_avc_log_spoofing_enabled = true;
+                hymo_log("AVC log spoofing enabled\n");
+            } else {
+                hymo_is_avc_log_spoofing_enabled = false;
+                hymo_log("AVC log spoofing disabled\n");
+            }
             break;
 
         default:
@@ -619,62 +699,6 @@ static long hymo_ioctl(struct file *file, unsigned int cmd, unsigned long arg) {
     return ret;
 }
 
-static ssize_t hymo_read(struct file *file, char __user *buf, size_t count, loff_t *ppos) {
-    char *kbuf;
-    size_t size = 128 * 1024;
-    size_t written = 0;
-    int bkt;
-    struct hymo_entry *entry;
-    struct hymo_hide_entry *hide_entry;
-    struct hymo_inject_entry *inject_entry;
-    struct hymo_xattr_sb_entry *sb_entry;
-    unsigned long flags;
-    ssize_t ret;
-
-    kbuf = vmalloc(size);
-    if (!kbuf) return -ENOMEM;
-    memset(kbuf, 0, size);
-
-    spin_lock_irqsave(&hymo_lock, flags);
-    
-    written += scnprintf(kbuf + written, size - written, "HymoFS Protocol: %d\n", HYMO_PROTOCOL_VERSION);
-    written += scnprintf(kbuf + written, size - written, "HymoFS Config Version: %d\n", atomic_read(&hymo_version));
-
-    hash_for_each(hymo_paths, bkt, entry, node) {
-        if (written >= size) break;
-        written += scnprintf(kbuf + written, size - written, "add %s %s %d\n", entry->src, entry->target, entry->type);
-    }
-    hash_for_each(hymo_hide_paths, bkt, hide_entry, node) {
-        if (written >= size) break;
-        written += scnprintf(kbuf + written, size - written, "hide %s\n", hide_entry->path);
-    }
-    hash_for_each(hymo_inject_dirs, bkt, inject_entry, node) {
-        if (written >= size) break;
-        written += scnprintf(kbuf + written, size - written, "inject %s\n", inject_entry->dir);
-    }
-    hash_for_each(hymo_xattr_sbs, bkt, sb_entry, node) {
-        if (written >= size) break;
-        written += scnprintf(kbuf + written, size - written, "hide_xattr_sb %p\n", sb_entry->sb);
-    }
-    spin_unlock_irqrestore(&hymo_lock, flags);
-
-    ret = simple_read_from_buffer(buf, count, ppos, kbuf, written);
-    vfree(kbuf);
-    return ret;
-}
-
-static const struct file_operations hymo_misc_fops = {
-    .owner = THIS_MODULE,
-    .unlocked_ioctl = hymo_ioctl,
-    .read = hymo_read,
-};
-
-static struct miscdevice hymo_misc_dev = {
-    .minor = MISC_DYNAMIC_MINOR,
-    .name = HYMO_CTL_NAME,
-    .fops = &hymo_misc_fops,
-};
-
 static int __init hymofs_init(void)
 {
     spin_lock_init(&hymo_lock);
@@ -684,9 +708,13 @@ static int __init hymofs_init(void)
     hash_init(hymo_inject_dirs);
     hash_init(hymo_xattr_sbs);
     
-    misc_register(&hymo_misc_dev);
+    if (hymo_dispatch_cmd_hook) {
+        pr_err("HymoFS: hook already set?\n");
+    } else {
+        hymo_dispatch_cmd_hook = hymo_dispatch_cmd;
+    }
     
-    pr_info("HymoFS: initialized (IOCTL Mode)\n");
+    pr_info("HymoFS: initialized (Syscall Mode)\n");
     return 0;
 }
 fs_initcall(hymofs_init);
@@ -768,6 +796,12 @@ bool __hymofs_should_hide(const char *pathname)
     spin_lock_irqsave(&hymo_lock, flags);
     hash_for_each_possible(hymo_hide_paths, entry, node, hash) {
         if (strcmp(entry->path, pathname) == 0) {
+#ifdef CONFIG_HYMOFS_USE_KSU
+            if (susfs_is_current_ksu_domain()) {
+                found = false;
+                break;
+            }
+#endif
             found = true;
             hymo_log("hide %s\n", pathname);
             break;
@@ -787,6 +821,10 @@ bool __hymofs_should_spoof_mtime(const char *pathname)
 
     if (atomic_read(&hymo_version) == 0) return false;
     if (!pathname) return false;
+
+#ifdef CONFIG_HYMOFS_USE_KSU
+    if (susfs_is_current_ksu_domain()) return false;
+#endif
 
     hash = full_name_hash(NULL, pathname, strlen(pathname));
 
@@ -811,6 +849,10 @@ static bool __hymofs_should_replace(const char *pathname)
 
     if (atomic_read(&hymo_version) == 0) return false;
     if (!pathname) return false;
+
+#ifdef CONFIG_HYMOFS_USE_KSU
+    if (susfs_is_current_ksu_domain()) return false;
+#endif
 
     hash = full_name_hash(NULL, pathname, strlen(pathname));
 
