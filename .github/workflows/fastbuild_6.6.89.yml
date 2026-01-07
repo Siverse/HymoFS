@@ -9,7 +9,7 @@ env:
 on:
   push:
     branches:
-      - main
+      - android15_6.6
       
 jobs:
   build:
