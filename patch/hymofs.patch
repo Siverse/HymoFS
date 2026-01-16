@@ -2917,7 +2917,7 @@ index 9c53edb60..5bb548300 100644
  	return error;
  }
 diff --git a/fs/stat.c b/fs/stat.c
-index ef50573c7..e54523e83 100644
+index ef50573c7..ef19997de 100644
 --- a/fs/stat.c
 +++ b/fs/stat.c
 @@ -25,6 +25,10 @@
@@ -2937,7 +2937,7 @@ index ef50573c7..e54523e83 100644
  	mnt_userns = mnt_user_ns(path->mnt);
 +#ifdef CONFIG_HYMOFS
 +	if (inode->i_op->getattr) {
-+		int ret = inode->i_op->getattr(idmap, path, stat,
++		int ret = inode->i_op->getattr(mnt_userns, path, stat,
 +					    request_mask,
 +					    query_flags);
 +#ifdef CONFIG_HYMOFS_STAT_SPOOF
